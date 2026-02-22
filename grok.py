@@ -4,8 +4,12 @@ import concurrent.futures
 from urllib.parse import urljoin, urlparse
 from curl_cffi import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+import requests as std_requests
 
 from g import EmailService, TurnstileService, UserAgreementService, NsfwSettingsService
+
+load_dotenv()
 
 # 基础配置
 site_url = "https://accounts.x.ai"
@@ -73,6 +77,62 @@ def encode_grpc_message_verify(email, code):
     p2 = struct.pack('B', (2 << 3) | 2) + struct.pack('B', len(code)) + code.encode('utf-8')
     payload = p1 + p2
     return b'\x00' + struct.pack('>I', len(payload)) + payload
+
+# ── grok2api 自动导入 ──
+GROK2API_URL = os.getenv("GROK2API_URL", "").strip()
+GROK2API_KEY = os.getenv("GROK2API_KEY", "").strip()
+GROK2API_POOL = os.getenv("GROK2API_POOL", "ssoSuper").strip()
+import_lock = threading.Lock()
+
+def push_token_to_grok2api(sso_token):
+    """注册成功后自动推送 token 到 grok2api"""
+    if not GROK2API_URL or not GROK2API_KEY:
+        return False
+    try:
+        with import_lock:
+            # 先获取现有 tokens
+            res = std_requests.get(
+                f"{GROK2API_URL}/v1/admin/tokens",
+                headers={"Authorization": f"Bearer {GROK2API_KEY}"},
+                timeout=10
+            )
+            existing = res.json() if res.status_code == 200 else {}
+            pool_tokens = existing.get(GROK2API_POOL, [])
+
+            # 提取现有 token 字符串列表
+            existing_raw = []
+            for t in pool_tokens:
+                if isinstance(t, str):
+                    existing_raw.append(t)
+                elif isinstance(t, dict):
+                    existing_raw.append(t.get("token", ""))
+
+            # 去重：如果已存在则跳过
+            if sso_token in existing_raw:
+                print(f"    [grok2api] token 已存在，跳过")
+                return True
+
+            # 追加新 token
+            existing_raw.append(sso_token)
+            res = std_requests.post(
+                f"{GROK2API_URL}/v1/admin/tokens",
+                headers={
+                    "Authorization": f"Bearer {GROK2API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={GROK2API_POOL: existing_raw},
+                timeout=10
+            )
+            if res.status_code == 200:
+                print(f"    [grok2api] ✓ token 已自动导入 ({GROK2API_POOL} 池)")
+                return True
+            else:
+                print(f"    [grok2api] ✗ 导入失败: {res.status_code}")
+                return False
+    except Exception as e:
+        print(f"    [grok2api] ✗ 导入异常: {e}")
+        return False
+
 
 def send_email_code_grpc(session, email):
     url = f"{site_url}/auth_mgmt.AuthManagement/CreateEmailValidationCode"
@@ -264,6 +324,8 @@ def register_single_thread():
                                 avg = (time.time() - start_time) / success_count
                                 nsfw_tag = "✓" if unhinged_ok else "✗"
                                 print(f"[✓] 注册成功: {success_count}/{target_count} | {email} | SSO: {sso[:15]}... | 平均: {avg:.1f}s | NSFW: {nsfw_tag}")
+                                # 自动推送到 grok2api
+                                push_token_to_grok2api(sso)
                                 email_service.delete_email(email)
                                 current_email = None
                                 if success_count >= target_count and not stop_event.is_set():
@@ -341,6 +403,10 @@ def main():
 
     print(f"[*] 启动 {t} 个线程，目标 {target_count} 个")
     print(f"[*] 输出: {output_file}")
+    if GROK2API_URL:
+        print(f"[*] 自动导入: {GROK2API_URL} → {GROK2API_POOL} 池")
+    else:
+        print(f"[*] 自动导入: 未配置 (仅保存到本地文件)")
     with concurrent.futures.ThreadPoolExecutor(max_workers=t) as executor:
         futures = [executor.submit(register_single_thread) for _ in range(t)]
         concurrent.futures.wait(futures)
